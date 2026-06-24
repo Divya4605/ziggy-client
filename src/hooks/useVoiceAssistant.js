@@ -32,18 +32,33 @@ export const useVoiceAssistant = () => {
   const [speechMethod, setSpeechMethod] = useState("native");
   const [loginStep, setLoginStep] = useState(null);
   const [loginEmail, setLoginEmail] = useState("");
-  const [transcriptTimeout, setTranscriptTimeout] = useState(null);
-  const [processedCommands, setProcessedCommands] = useState([]);
   const [isMuted, setIsMuted] = useState(false);
+
+  // Refs for stable, non-stale access inside callbacks
   const isMutedRef = useRef(false);
+  const isProcessingRef = useRef(false);
+  const isSpeakingRef = useRef(false);
+  const isListeningRef = useRef(false);
+  const loginStepRef = useRef(null);
+  const loginEmailRef = useRef("");
+  const lastProcessedRef = useRef(""); // Track last processed command to avoid duplicates
+
+  // Keep refs in sync with state
+  useEffect(() => { isProcessingRef.current = isProcessing; }, [isProcessing]);
+  useEffect(() => { isSpeakingRef.current = isSpeaking; }, [isSpeaking]);
+  useEffect(() => { isListeningRef.current = isListening; }, [isListening]);
+  useEffect(() => { loginStepRef.current = loginStep; }, [loginStep]);
+  useEffect(() => { loginEmailRef.current = loginEmail; }, [loginEmail]);
 
   const {
     transcript,
     resetTranscript,
     browserSupportsSpeechRecognition,
     isMicrophoneAvailable,
+    listening: srListening,
   } = useSpeechRecognition();
 
+  // Detect TTS voices on mount
   useEffect(() => {
     const updateVoices = () => {
       if ("speechSynthesis" in window) {
@@ -51,15 +66,16 @@ export const useVoiceAssistant = () => {
         setSpeechMethod(voices.length > 0 ? "native" : "google");
       }
     };
-
     updateVoices();
     if (window.speechSynthesis) {
       window.speechSynthesis.onvoiceschanged = updateVoices;
     }
   }, []);
 
+  // ── speakResponse ────────────────────────────────────────────────────────────
   const speakResponse = useCallback(
     async (text) => {
+      if (isMutedRef.current) return;
       setIsSpeaking(true);
       try {
         if (speechMethod === "native") {
@@ -77,22 +93,16 @@ export const useVoiceAssistant = () => {
           if (preferredVoice) utterance.voice = preferredVoice;
           utterance.rate = 1.0;
           utterance.pitch = 1.0;
-          utterance.volume = isMutedRef.current ? 0 : 1;
+          utterance.volume = 1;
           utterance.onend = () => setIsSpeaking(false);
           utterance.onerror = (event) => {
             setIsSpeaking(false);
             if (event.error === "canceled" || event.error === "interrupted")
               return;
-            if (speechMethod !== "google") {
-              setSpeechMethod("google");
-              speakResponse(text);
-            }
           };
           window.speechSynthesis.speak(utterance);
         } else {
-          if (!isMutedRef.current) {
-            await playAudioFromText(text).catch(console.error);
-          }
+          await playAudioFromText(text).catch(console.error);
           setIsSpeaking(false);
         }
       } catch {
@@ -102,7 +112,8 @@ export const useVoiceAssistant = () => {
     [speechMethod],
   );
 
-  const handleLogin = async (email, password) => {
+  // ── handleLogin ──────────────────────────────────────────────────────────────
+  const handleLogin = useCallback(async (email, password) => {
     try {
       const res = await fetch(API.login, {
         method: "POST",
@@ -122,8 +133,9 @@ export const useVoiceAssistant = () => {
       setLoginStep(null);
       setLoginEmail("");
     }
-  };
+  }, [login, speakResponse]);
 
+  // ── handleCommand ────────────────────────────────────────────────────────────
   const handleCommand = useCallback(
     async (commandData) => {
       switch (commandData.command) {
@@ -200,6 +212,7 @@ export const useVoiceAssistant = () => {
     [navigate, foodData, updateQuantity, logout, speakResponse],
   );
 
+  // ── processVoiceCommand ──────────────────────────────────────────────────────
   const processVoiceCommand = useCallback(
     async (command) => {
       setIsProcessing(true);
@@ -249,98 +262,116 @@ export const useVoiceAssistant = () => {
     [speakResponse, handleCommand],
   );
 
+  // ── processTranscript ────────────────────────────────────────────────────────
+  // Uses refs so it never goes stale but always reads current state
   const processTranscript = useCallback(
     async (text) => {
-      if (!text || processedCommands.includes(text)) return;
-      setProcessedCommands((prev) => [...prev, text]);
-      setMessages((prev) => [...prev, { type: "user", text }]);
-      resetTranscript();
+      const trimmed = text?.trim();
+      if (!trimmed) return;
+      // Avoid double-processing the exact same command in rapid succession
+      if (trimmed === lastProcessedRef.current) return;
+      lastProcessedRef.current = trimmed;
+
+      // Stop listening before processing
       SpeechRecognition.stopListening();
       setIsListening(false);
-      if (loginStep === "awaiting_email") {
-        setLoginEmail(text);
+      resetTranscript();
+
+      setMessages((prev) => [...prev, { type: "user", text: trimmed }]);
+
+      if (loginStepRef.current === "awaiting_email") {
+        setLoginEmail(trimmed);
         setLoginStep("awaiting_password");
         speakResponse("Please say your password");
+        // Clear lastProcessed so user can say password next
+        lastProcessedRef.current = "";
         return;
       }
-      if (loginStep === "awaiting_password") {
-        await handleLogin(loginEmail, text);
+      if (loginStepRef.current === "awaiting_password") {
+        const email = loginEmailRef.current;
+        await handleLogin(email, trimmed);
+        lastProcessedRef.current = "";
         return;
       }
-      await processVoiceCommand(text);
+
+      await processVoiceCommand(trimmed);
+      // Allow the same phrase again after processing completes
+      lastProcessedRef.current = "";
     },
-    [
-      processedCommands,
-      resetTranscript,
-      loginStep,
-      processVoiceCommand,
-      speakResponse,
-      handleLogin,
-      loginEmail,
-    ],
+    [resetTranscript, speakResponse, handleLogin, processVoiceCommand],
   );
 
+  // ── Transcript debounce — fires 1.5 s after the user stops speaking ──────────
   useEffect(() => {
-    if (!transcript || !isListening) return;
-    if (transcriptTimeout) clearTimeout(transcriptTimeout);
-    const timeout = setTimeout(() => processTranscript(transcript), 2000);
-    setTranscriptTimeout(timeout);
+    if (!transcript || !srListening) return;
+    const timeout = setTimeout(() => {
+      processTranscript(transcript);
+    }, 1500);
     return () => clearTimeout(timeout);
-  }, [transcript, isListening, transcriptTimeout, processTranscript]);
+  }, [transcript, srListening]);
 
+  // ── startListening ───────────────────────────────────────────────────────────
   const startListening = useCallback(() => {
+    if (isProcessingRef.current || isSpeakingRef.current) return;
     window.speechSynthesis?.cancel();
     setAssistantResponse("");
-    setIsListening(true);
     resetTranscript();
+    setIsListening(true);
     SpeechRecognition.startListening({
       continuous: true,
-      interimResults: true,
+      language: "en-US",
     });
-  });
+  }, [resetTranscript]);
 
-  const stopListening = () => {
+  // ── stopListening ────────────────────────────────────────────────────────────
+  const stopListening = useCallback(() => {
     SpeechRecognition.stopListening();
     setIsListening(false);
-    if (transcript) processTranscript(transcript);
-  };
+    resetTranscript();
+  }, [resetTranscript]);
 
-  const openAssistant = () => setTogg(true);
-  const closeAssistant = () => {
+  // ── Auto-restart listening after speaking/processing completes ───────────────
+  useEffect(() => {
+    if (!Togg) return;
+    if (isProcessing || isSpeaking || isListening) return;
+    const timer = setTimeout(() => {
+      // Double-check with refs to avoid stale closure issues
+      if (!isProcessingRef.current && !isSpeakingRef.current && !isListeningRef.current) {
+        startListening();
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [Togg, isProcessing, isSpeaking, isListening]);
+
+  // ── Open / Close assistant ───────────────────────────────────────────────────
+  const openAssistant = useCallback(() => {
+    lastProcessedRef.current = "";
+    setTogg(true);
+  }, [setTogg]);
+
+  const closeAssistant = useCallback(() => {
     window.speechSynthesis?.cancel();
+    SpeechRecognition.stopListening();
     setTogg(false);
     setIsListening(false);
     setAssistantResponse("");
     setMessages([]);
-    setProcessedCommands([]);
     setLoginStep(null);
     setLoginEmail("");
+    lastProcessedRef.current = "";
     resetTranscript();
-  };
+  }, [setTogg, resetTranscript]);
 
-  const toggleMute = () => {
-    const newMuted = !isMuted;
-    setIsMuted(newMuted);
+  // ── Mute / Unmute ────────────────────────────────────────────────────────────
+  const toggleMute = useCallback(() => {
+    const newMuted = !isMutedRef.current;
     isMutedRef.current = newMuted;
+    setIsMuted(newMuted);
     if (newMuted) {
       window.speechSynthesis?.cancel();
       setIsSpeaking(false);
     }
-  };
-
-  useEffect(() => {
-    if (Togg && !isListening && !isProcessing && !isSpeaking) {
-      const timer = setTimeout(() => startListening(), 150);
-      return () => clearTimeout(timer);
-    }
-  }, [Togg, isListening, isProcessing, isSpeaking, startListening]);
-
-  useEffect(() => {
-    if (Togg && !isSpeaking && !isProcessing && !isListening) {
-      const timer = setTimeout(() => startListening(), 500);
-      return () => clearTimeout(timer);
-    }
-  }, [Togg, isSpeaking, isProcessing, isListening, startListening]);
+  }, []);
 
   return {
     Togg,

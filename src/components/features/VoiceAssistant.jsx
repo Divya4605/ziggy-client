@@ -110,16 +110,22 @@ const VoiceAssistant = () => {
         </button>
 
         <div
-          className={`transition-all duration-500 overflow-hidden ${isListening || !browserSupportsSpeechRecognition || isMicrophoneAvailable === false ? "h-24 opacity-100 mt-4" : "h-0 opacity-0"}`}
+          className={`transition-all duration-500 overflow-hidden ${
+            !browserSupportsSpeechRecognition || isMicrophoneAvailable === false
+              ? "h-24 opacity-100 mt-4"
+              : isListening
+              ? "h-24 opacity-100 mt-4"
+              : "h-0 opacity-0"
+          }`}
         >
           <div className="flex flex-col items-center justify-center h-full gap-3 bg-surface/50 rounded-2xl border border-border/50 p-4">
             {!browserSupportsSpeechRecognition ? (
               <div className="text-[10px] text-red-600 font-bold text-center">
-                Your browser does not support Speech Recognition.
+                Your browser does not support Speech Recognition. Please use Chrome.
               </div>
             ) : isMicrophoneAvailable === false ? (
               <div className="text-[10px] text-red-600 font-bold text-center">
-                Microphone access denied. Please allow permissions.
+                Microphone access denied. Please allow mic permissions and refresh.
               </div>
             ) : (
               <>
@@ -138,7 +144,7 @@ const VoiceAssistant = () => {
                 </div>
                 <div className="text-[10px] text-ink font-bold italic text-center min-h-[1.5em] line-clamp-2">
                   {transcript
-                    ? `"${transcript}..."`
+                    ? `"${transcript}"`
                     : "Listening for your command..."}
                 </div>
               </>
